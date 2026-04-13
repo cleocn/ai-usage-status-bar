@@ -3,8 +3,16 @@ const vscode = require("vscode");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 
 const COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user";
+const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_AUTH_URL = "https://claude.com/cai/oauth/authorize";
+const CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const ANTHROPIC_API_VERSION = "2023-06-01";
+const CLAUDE_SECRET_KEY = "claude.tokens";
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const CODEX_DIR = path.join(os.homedir(), ".codex");
 const CODEX_AUTH_PATH = path.join(CODEX_DIR, "auth.json");
@@ -20,15 +28,22 @@ const CURSOR_DB_PATH = path.join(
 let statusBarItem;
 let chatgptStatusBarItem;
 let cursorStatusBarItem;
+let claudeStatusBarItem;
 let refreshTimer;
 let chatgptLastUpdatedAt;
+let extensionContext;
 const CURSOR_ICON_FALLBACK = "◈";
+const CLAUDE_ICON_FALLBACK = "◆";
 
 function getCursorPrefix() {
   // NOTE:
   // Custom contributed icons are not reliably rendered inside StatusBarItem.text
   // across VS Code versions/themes. Keep a stable visible unicode fallback.
   return CURSOR_ICON_FALLBACK;
+}
+
+function getClaudePrefix() {
+  return CLAUDE_ICON_FALLBACK;
 }
 
 function getConfig() {
@@ -47,9 +62,11 @@ function applyProviderVisibility() {
   cfg.get('providers.copilot', true) ? statusBarItem.show() : statusBarItem.hide();
   cfg.get('providers.chatgpt', true) ? chatgptStatusBarItem.show() : chatgptStatusBarItem.hide();
   cfg.get('providers.cursor', true) ? cursorStatusBarItem.show() : cursorStatusBarItem.hide();
+  cfg.get('providers.claude', true) ? claudeStatusBarItem.show() : claudeStatusBarItem.hide();
 }
 
 async function activate(context) {
+  extensionContext = context;
   // Create status bar item (left side, low priority so it doesn't crowd)
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -75,6 +92,14 @@ async function activate(context) {
   cursorStatusBarItem.command = "aiUsage.refreshCursor";
   context.subscriptions.push(cursorStatusBarItem);
 
+  // Claude status bar item
+  claudeStatusBarItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    47
+  );
+  claudeStatusBarItem.command = "aiUsage.refreshClaude";
+  context.subscriptions.push(claudeStatusBarItem);
+
   // Apply initial visibility from settings
   applyProviderVisibility();
 
@@ -91,6 +116,18 @@ async function activate(context) {
     }),
     vscode.commands.registerCommand("aiUsage.refreshCursor", () => {
       fetchAndRenderCursor();
+    }),
+    vscode.commands.registerCommand("aiUsage.openClaudeUsage", () => {
+      vscode.env.openExternal(vscode.Uri.parse("https://claude.ai/settings/usage"));
+    }),
+    vscode.commands.registerCommand("aiUsage.refreshClaude", () => {
+      fetchAndRenderClaude();
+    }),
+    vscode.commands.registerCommand("aiUsage.authenticateClaude", () => {
+      startClaudeOAuth();
+    }),
+    vscode.commands.registerCommand("aiUsage.signOutClaude", () => {
+      signOutClaude();
     })
   );
 
@@ -98,12 +135,14 @@ async function activate(context) {
   await fetchAndRender(false);
   renderChatGPT();
   fetchAndRenderCursor();
+  fetchAndRenderClaude();
 
   // Periodic refresh
   refreshTimer = setInterval(() => {
     fetchAndRender(false);
     renderChatGPT();
     fetchAndRenderCursor();
+    fetchAndRenderClaude();
   }, REFRESH_INTERVAL_MS);
   context.subscriptions.push({ dispose: () => clearInterval(refreshTimer) });
 
@@ -114,6 +153,7 @@ async function activate(context) {
         fetchAndRender(false);
         renderChatGPT();
         fetchAndRenderCursor();
+        fetchAndRenderClaude();
       }
     })
   );
@@ -545,6 +585,353 @@ function renderChatGPT() {
 
 function deactivate() {
   clearInterval(refreshTimer);
+}
+
+// ---------- Claude ----------
+
+function base64urlEncode(buf) {
+  return buf.toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function generatePKCE() {
+  const codeVerifier = base64urlEncode(crypto.randomBytes(32));
+  const codeChallenge = base64urlEncode(
+    crypto.createHash("sha256").update(codeVerifier).digest()
+  );
+  return { codeVerifier, codeChallenge };
+}
+
+async function startClaudeOAuth() {
+  const { codeVerifier, codeChallenge } = generatePKCE();
+  const state = base64urlEncode(crypto.randomBytes(16));
+
+  // Find a free local port for the OAuth callback (RFC 8252 loopback redirect)
+  let port;
+  try {
+    port = await new Promise((resolve, reject) => {
+      const srv = require("net").createServer();
+      srv.listen(0, "127.0.0.1", () => { const p = srv.address().port; srv.close(() => resolve(p)); });
+      srv.on("error", reject);
+    });
+  } catch (e) {
+    vscode.window.showErrorMessage(`Claude 授权失败：无法绑定本地端口 (${e.message})`);
+    return;
+  }
+
+  const redirectUri = `http://localhost:${port}/callback`;
+  const authParams = new URLSearchParams({
+    code: "true",
+    response_type: "code",
+    client_id: CLAUDE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    scope: CLAUDE_OAUTH_SCOPE,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    state,
+  });
+
+  let serverResolve, serverReject;
+  const callbackPromise = new Promise((res, rej) => { serverResolve = res; serverReject = rej; });
+
+  const server = require("http").createServer((req, res) => {
+    const reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+    if (reqUrl.pathname !== "/callback") { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(
+      `<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">` +
+      `<h2>Claude 授权成功</h2><p>请关闭此标签页并返回 VS Code。</p>` +
+      `<script>window.close();</script></body></html>`
+    );
+    server.close();
+    const code = reqUrl.searchParams.get("code");
+    const returnedState = reqUrl.searchParams.get("state");
+    if (returnedState !== state) { serverReject(new Error("state 不匹配，验证失败")); return; }
+    serverResolve({ code, redirectUri });
+  });
+  server.listen(port, "127.0.0.1");
+
+  const timer = setTimeout(() => {
+    server.close();
+    serverReject(new Error("授权超时（5 分钟），请重试"));
+  }, 5 * 60 * 1000);
+
+  await vscode.env.openExternal(vscode.Uri.parse(`${CLAUDE_AUTH_URL}?${authParams}`));
+
+  try {
+    const { code, redirectUri: usedRedirectUri } = await callbackPromise;
+    clearTimeout(timer);
+    const tokenRes = await fetch(CLAUDE_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "anthropic-version": ANTHROPIC_API_VERSION,
+      },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: CLAUDE_CLIENT_ID,
+        code,
+        redirect_uri: usedRedirectUri,
+        code_verifier: codeVerifier,
+        state,
+        scope: CLAUDE_OAUTH_SCOPE,
+      }),
+    });
+    if (!tokenRes.ok) {
+      const text = await tokenRes.text();
+      throw new Error(`token 交换失败: ${tokenRes.status} ${text.substring(0, 200)}`);
+    }
+    const tokens = await tokenRes.json();
+    const tokenData = {
+      accessToken: tokens.access_token ?? tokens.token ?? null,
+      refreshToken: tokens.refresh_token ?? tokens.refreshToken ?? null,
+      expiresAt: tokens.expires_in
+        ? Date.now() + tokens.expires_in * 1000
+        : (tokens.expiresAt ?? null),
+    };
+    if (!tokenData.accessToken) {
+      throw new Error("token 响应缺少 access_token");
+    }
+    await extensionContext.secrets.store(CLAUDE_SECRET_KEY, JSON.stringify(tokenData));
+    vscode.window.showInformationMessage("Claude 授权成功！");
+    await fetchAndRenderClaude();
+  } catch (e) {
+    clearTimeout(timer);
+    server.close();
+    vscode.window.showErrorMessage(`Claude 授权失败: ${e.message}`);
+  }
+}
+
+async function refreshClaudeToken(tokenData) {
+  try {
+    const tokenRes = await fetch(CLAUDE_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "anthropic-version": ANTHROPIC_API_VERSION,
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: CLAUDE_CLIENT_ID,
+        refresh_token: tokenData.refreshToken,
+        scope: CLAUDE_OAUTH_SCOPE,
+      }),
+    });
+    if (!tokenRes.ok) return null;
+    const tokens = await tokenRes.json();
+    const newData = {
+      accessToken: tokens.access_token ?? tokens.token ?? null,
+      refreshToken: tokens.refresh_token ?? tokens.refreshToken ?? tokenData.refreshToken,
+      expiresAt: tokens.expires_in
+        ? Date.now() + tokens.expires_in * 1000
+        : (tokens.expiresAt ?? tokenData.expiresAt ?? null),
+    };
+    if (!newData.accessToken) return null;
+    await extensionContext.secrets.store(CLAUDE_SECRET_KEY, JSON.stringify(newData));
+    return newData;
+  } catch {
+    return null;
+  }
+}
+
+async function signOutClaude() {
+  await extensionContext.secrets.delete(CLAUDE_SECRET_KEY).catch(() => {});
+  claudeStatusBarItem.text = `${getClaudePrefix()} Claude: 未授权`;
+  claudeStatusBarItem.tooltip = "已退出 Claude，点击重新授权";
+  claudeStatusBarItem.command = "aiUsage.authenticateClaude";
+  claudeStatusBarItem.backgroundColor = undefined;
+  vscode.window.showInformationMessage("已退出 Claude");
+}
+
+async function resolveClaudeToken() {
+  // 1. SecretStorage (from OAuth flow)
+  try {
+    const raw = await extensionContext.secrets.get(CLAUDE_SECRET_KEY);
+    if (raw) {
+      const tokenData = JSON.parse(raw);
+      if (tokenData.expiresAt && Date.now() > tokenData.expiresAt - 5 * 60 * 1000) {
+        if (tokenData.refreshToken) {
+          const refreshed = await refreshClaudeToken(tokenData);
+          if (refreshed) return refreshed.accessToken;
+        }
+      }
+      if (tokenData.accessToken) return tokenData.accessToken;
+    }
+  } catch {}
+
+  // 2. Claude Desktop app — read encrypted token from config.json (macOS only)
+  if (os.platform() === "darwin") {
+    try {
+      const token = await readClaudeDesktopToken();
+      if (token) return token;
+    } catch {}
+  }
+
+  // 3. Legacy fallback: settings or environment variable
+  const cfgToken = getConfig().get('claude.oauthToken', '');
+  return pickFirstNonEmpty(cfgToken, process.env.ANTHROPIC_OAUTH_TOKEN, process.env.CLAUDE_OAUTH_TOKEN) ?? null;
+}
+
+/**
+ * Read the OAuth access_token from Claude Desktop's config.json.
+ * The value is encrypted with Chromium OSCrypt (AES-128-CBC, key from macOS Keychain).
+ */
+async function readClaudeDesktopToken() {
+  const configPath = path.join(os.homedir(), "Library", "Application Support", "Claude", "config.json");
+  if (!fs.existsSync(configPath)) return null;
+  const configRaw = fs.readFileSync(configPath, "utf8");
+  const config = JSON.parse(configRaw);
+  const encryptedB64 = config["oauth:tokenCache"];
+  if (typeof encryptedB64 !== "string") return null;
+
+  const encryptedBuf = Buffer.from(encryptedB64, "base64");
+  if (encryptedBuf.slice(0, 3).toString() !== "v10") return null;
+  const ciphertext = encryptedBuf.slice(3);
+
+  // Get password from macOS Keychain
+  const { execSync } = require("child_process");
+  let password;
+  try {
+    password = execSync('security find-generic-password -s "Claude Safe Storage" -a "Claude Key" -w', {
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return null;
+  }
+  if (!password) return null;
+
+  // Derive 128-bit key: PBKDF2(password, "saltysalt", 1003 iterations, 16 bytes, SHA-1)
+  const key = await new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, "saltysalt", 1003, 16, "sha1", (err, derivedKey) => {
+      if (err) reject(err); else resolve(derivedKey);
+    });
+  });
+
+  // Decrypt AES-128-CBC with IV = 16 space characters
+  const iv = Buffer.alloc(16, 0x20);
+  const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
+  decipher.setAutoPadding(true);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+
+  // tokenCache structure: { [clientId:orgId:audience:scopes]: { token, refreshToken, expiresAt } }
+  const tokenCache = JSON.parse(decrypted);
+  const entry = Object.values(tokenCache)[0];
+  if (!entry || typeof entry !== "object") return null;
+  return entry.token ?? entry.access_token ?? entry.accessToken ?? null;
+}
+
+async function fetchClaudeUsage(token) {
+  const res = await fetch(CLAUDE_USAGE_URL, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20",
+      "User-Agent": "vscode-ai-usage-statusbar/1.0",
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function toPctFromUtilization(utilization) {
+  if (typeof utilization !== "number" || Number.isNaN(utilization)) return null;
+  // Claude API 可能返回 0-1（比例）或 0-100（百分比），都要兼容
+  if (utilization > 1) {
+    // 已是百分比
+    return Math.max(0, Math.min(100, Math.round(utilization)));
+  } else {
+    // 比例
+    return Math.max(0, Math.min(100, Math.round(utilization * 100)));
+  }
+}
+
+async function fetchAndRenderClaude() {
+  const claudePrefix = getClaudePrefix();
+  claudeStatusBarItem.text = "$(sync~spin) Claude";
+  claudeStatusBarItem.tooltip = "Claude 用量加载中…";
+
+  const token = await resolveClaudeToken();
+  if (!token) {
+    claudeStatusBarItem.text = `${claudePrefix} Claude: 未授权`;
+    const isMac = os.platform() === "darwin";
+    claudeStatusBarItem.tooltip = [
+      "尚未授权 Claude",
+      isMac
+        ? "• 若已安装 Claude Desktop，重启 VS Code 后会自动读取授权（macOS Keychain）"
+        : "",
+      "• 或点击运行命令「AI Usage: Authorize Claude (OAuth Login)」手动授权",
+    ].filter(Boolean).join("\n");
+    claudeStatusBarItem.command = "aiUsage.authenticateClaude";
+    claudeStatusBarItem.backgroundColor = undefined;
+    return;
+  }
+
+  try {
+    const data = await fetchClaudeUsage(token);
+    const fiveHour = data?.five_hour ?? null;
+    const sevenDay = data?.seven_day ?? null;
+    const fiveUsed = toPctFromUtilization(fiveHour?.utilization);
+    const sevenUsed = toPctFromUtilization(sevenDay?.utilization);
+    // DEBUG: 输出原始和转换后数值
+    vscode.window.showInformationMessage(`DEBUG: 7d raw=${sevenDay?.utilization}, used=${sevenUsed}, rem=${sevenUsed === null ? 'null' : 100 - sevenUsed}`);
+    const fiveRem = fiveUsed === null ? null : Math.max(0, 100 - fiveUsed);
+    const sevenRem = sevenUsed === null ? null : Math.max(0, 100 - sevenUsed);
+    vscode.window.showInformationMessage(`DEBUG: 7d fiveRem=${fiveRem}, sevenRem=${sevenRem}`);
+
+    const fiveWindow = fiveHour?.resets_at
+      ? formatRemainingDaysLabel(new Date(fiveHour.resets_at).getTime())
+      : "5h";
+    const sevenWindow = sevenDay?.resets_at
+      ? formatRemainingDaysLabel(new Date(sevenDay.resets_at).getTime())
+      : "7d";
+
+    const usageParts = [];
+    // DEBUG: usageParts 拼接前
+    // vscode.window.showInformationMessage(`DEBUG: usageParts before: fiveRem=${fiveRem}, sevenRem=${sevenRem}`);
+    if (fiveRem !== null) usageParts.push(`${fiveWindow} ${fiveRem}%`);
+    if (sevenRem !== null) usageParts.push(`${sevenWindow} ${sevenRem}%`);
+    // vscode.window.showInformationMessage(`DEBUG: usageParts after: ${usageParts.join(' | ')}`);
+
+    const verbose = getConfig().get('style', 'minimal') === 'verbose';
+    const usageCompact = usageParts.length > 0 ? usageParts.join(" ") : "- -";
+    claudeStatusBarItem.text = verbose
+      ? `${claudePrefix} Claude ${usageCompact}`
+      : `${claudePrefix} ${usageCompact}`;
+
+    claudeStatusBarItem.tooltip = [
+      "Claude 用量",
+      fiveUsed !== null ? `5h 窗口: 已用 ${fiveUsed}% / 剩余 ${fiveRem}%` : "5h 窗口: 暂无数据",
+      sevenUsed !== null ? `7d 窗口: 已用 ${sevenUsed}% / 剩余 ${sevenRem}%` : "7d 窗口: 暂无数据",
+      sevenDay && typeof sevenDay.utilization === 'number' ? `7d utilization 原始值: ${sevenDay.utilization}` : "",
+      fiveHour?.resets_at ? `5h 重置时间: ${new Date(fiveHour.resets_at).toLocaleString("zh-CN")}` : "",
+      sevenDay?.resets_at ? `7d 重置时间: ${new Date(sevenDay.resets_at).toLocaleString("zh-CN")}` : "",
+      "",
+      "数据来自 api.anthropic.com/api/oauth/usage",
+      "点击打开 claude.ai 用量页面",
+    ].filter(Boolean).join("\n");
+
+    const lowestRemaining = [fiveRem, sevenRem]
+      .filter((v) => typeof v === "number")
+      .reduce((min, v) => Math.min(min, v), 100);
+    claudeStatusBarItem.backgroundColor = lowestRemaining <= 20
+      ? new vscode.ThemeColor("statusBarItem.warningBackground")
+      : undefined;
+    claudeStatusBarItem.command = "aiUsage.refreshClaude";
+  } catch (e) {
+    const is401 = /HTTP 401/.test(e.message);
+    if (is401) {
+      await extensionContext.secrets.delete(CLAUDE_SECRET_KEY).catch(() => {});
+      claudeStatusBarItem.text = `${claudePrefix} Claude: 需重新授权`;
+      claudeStatusBarItem.tooltip = "Claude token 已失效，点击重新授权";
+      claudeStatusBarItem.command = "aiUsage.authenticateClaude";
+    } else {
+      claudeStatusBarItem.text = `${claudePrefix} -`;
+      claudeStatusBarItem.tooltip = `Claude 获取失败: ${e.message}\n点击重试`;
+      claudeStatusBarItem.command = "aiUsage.refreshClaude";
+    }
+    claudeStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+  }
 }
 
 // ---------- Cursor ----------

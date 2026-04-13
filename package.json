@@ -1,7 +1,7 @@
 {
   "name": "ai-usage-status-bar",
   "displayName": "AI Usage Status Bar for VS Code",
-  "description": "Show GitHub Copilot, ChatGPT/Codex, and Cursor usage in the VS Code status bar",
+  "description": "Show GitHub Copilot, ChatGPT/Codex, Cursor, and Claude usage in the VS Code status bar",
   "version": "1.0.3",
   "publisher": "cleocn",
   "license": "MIT",
@@ -31,6 +31,22 @@
       {
         "command": "aiUsage.refreshCursor",
         "title": "AI Usage: Refresh Cursor Usage"
+      },
+      {
+        "command": "aiUsage.openClaudeUsage",
+        "title": "AI Usage: Open Claude Usage Page"
+      },
+      {
+        "command": "aiUsage.refreshClaude",
+        "title": "AI Usage: Refresh Claude Usage"
+      },
+      {
+        "command": "aiUsage.authenticateClaude",
+        "title": "AI Usage: Authorize Claude (OAuth Login)"
+      },
+      {
+        "command": "aiUsage.signOutClaude",
+        "title": "AI Usage: Sign Out Claude"
       }
     ],
     "icons": {
@@ -66,6 +82,16 @@
           "type": "boolean",
           "default": true,
           "description": "在状态栏显示 Cursor 用量"
+        },
+        "aiUsage.providers.claude": {
+          "type": "boolean",
+          "default": true,
+          "description": "在状态栏显示 Claude 用量"
+        },
+        "aiUsage.claude.oauthToken": {
+          "type": "string",
+          "default": "",
+          "description": "Claude OAuth token（可选；优先于环境变量 ANTHROPIC_OAUTH_TOKEN / CLAUDE_OAUTH_TOKEN）"
         }
       }
     }

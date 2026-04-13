@@ -1,18 +1,21 @@
 # AI Usage Status Bar
 
-A minimal VS Code extension that shows **GitHub Copilot, ChatGPT, and Cursor** usage directly in the status bar — no browser needed.
+A minimal VS Code extension that shows **GitHub Copilot, ChatGPT, Cursor, and Claude** usage directly in the status bar — no browser needed.
 
 ![Status bar preview](./assets/statusbar-preview.png)
 
 English | [中文](./README.zh-CN.md)
 
+[Changelog](./CHANGELOG.md) | [中文更新日志](./CHANGELOG.zh-CN.md)
+
 ## Features
 
-- **3 providers** — GitHub Copilot quota, ChatGPT/Codex quota windows, and Cursor usage in one place
+- **4 providers** — GitHub Copilot quota, ChatGPT/Codex quota windows, Cursor usage, and Claude usage in one place
 - **Reset countdown prefix** — each item starts with an `Xd` countdown to the next reset point
 - **Codex dynamic windows** — status bar uses remaining-to-reset labels (for example `3h` and `6d`) with remaining %
 - **Cursor compact usage** — status bar shows Auto/API remaining % and appends OD amount when available
-- **Clear provider prefixes** — uses `$(github)` for Copilot, `$(openai)` for ChatGPT/Codex, and a stable `◈` fallback for Cursor
+- **Claude dual-window usage** — shows 5h/7d remaining percentages when OAuth usage data is available (auto-adapts to utilization in 0-1 or 0-100 format)
+- **Clear provider prefixes** — uses `$(github)` for Copilot, `$(openai)` for ChatGPT/Codex, a stable `◈` fallback for Cursor, and `◆` for Claude
 - **Unified external format** — all providers display remaining quota first in a compact format
 - **Color warnings** — warns on low remaining quota (Copilot / Codex / Cursor)
 - **Hover tooltip** — detailed breakdown on hover for each provider, including detected signed-in account
@@ -28,6 +31,7 @@ English | [中文](./README.zh-CN.md)
 | GitHub Copilot | Premium interactions remaining / total + remaining % | `api.github.com/copilot_internal/user` |
 | ChatGPT / Codex | Plan type + renewal date + **5h/7d usage windows** | `~/.codex/auth.json` JWT + `~/.codex/logs_1.sqlite` response headers |
 | Cursor | **Auto + Composer remaining %** and **API remaining %** (current billing cycle) | `api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage` |
+| Claude | **5h/7d remaining %** and reset times | `api.anthropic.com/api/oauth/usage` (OAuth token from setting or env var, utilization field auto-adapts 0-1 or 0-100) |
 
 > Codex window usage is extracted from local Codex logs (latest API response headers), so it appears after you use Codex at least once.
 
@@ -52,6 +56,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 - GitHub account signed in to VS Code with Copilot enabled
 - [OpenAI Codex CLI](https://github.com/openai/codex) installed and signed in (for ChatGPT info)
 - [Cursor](https://cursor.sh) installed and signed in (for Cursor info)
+- Claude: run **`AI Usage: Authorize Claude (OAuth Login)`** to complete a one-time browser authorization
 
 ## Platform Support
 
@@ -60,6 +65,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 | GitHub Copilot | ✅ | ✅ | ✅ |
 | ChatGPT / Codex | ✅ | ✅ | ✅ |
 | Cursor | ✅ | ✅ | ✅ |
+| Claude | ✅ | ✅ | ✅ |
 
 Cursor's `state.vscdb` is resolved per platform automatically:
 - **macOS**: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
@@ -67,6 +73,7 @@ Cursor's `state.vscdb` is resolved per platform automatically:
 - **Linux**: `~/.config/Cursor/User/globalStorage/state.vscdb`
 
 Codex paths (`~/.codex/`) and Copilot API calls are cross-platform by default.
+Claude uses browser OAuth which is cross-platform.
 
 ## Settings
 
@@ -81,16 +88,20 @@ Search **"AI Usage"** in VS Code Settings, or edit `settings.json` directly:
   // Toggle each provider's status bar item
   "aiUsage.providers.copilot": true,
   "aiUsage.providers.chatgpt": true,
-  "aiUsage.providers.cursor": true
+  "aiUsage.providers.cursor": true,
+  "aiUsage.providers.claude": true,
+
+  // Optional: Claude OAuth token (legacy, prefer command-based auth)
+  "aiUsage.claude.oauthToken": ""
 }
 ```
 
 **Style examples:**
 
-| Style | Copilot | ChatGPT | Cursor |
-|-------|---------|---------|--------|
-| `minimal` | `$(github) 10d 32/50 64%` | `$(openai) 10d 3h 90% 6d 54%` | `◈ 10d 21% 0% $1.20/$20.00` |
-| `verbose` | `$(github) 10d Copilot 32/50 64%` | `$(openai) 10d Codex 3h 90% 6d 54%` | `◈ 10d Cursor 21% 0% $1.20/$20.00` |
+| Style | Copilot | ChatGPT | Cursor | Claude |
+|-------|---------|---------|--------|--------|
+| `minimal` | `$(github) 10d 32/50 64%` | `$(openai) 10d 3h 90% 6d 54%` | `◈ 10d 21% 0% $1.20/$20.00` | `◆ 4h 85% 6d 41%` |
+| `verbose` | `$(github) 10d Copilot 32/50 64%` | `$(openai) 10d Codex 3h 90% 6d 54%` | `◈ 10d Cursor 21% 0% $1.20/$20.00` | `◆ Claude 4h 85% 6d 41%` |
 
 Settings take effect immediately without reloading.
 
@@ -102,12 +113,17 @@ Settings take effect immediately without reloading.
 | `Copilot Usage: Sign in to GitHub` | Trigger GitHub sign-in |
 | `AI Usage: Open ChatGPT Usage Page` | Open chatgpt.com usage settings |
 | `AI Usage: Refresh Cursor Usage` | Manually refresh Cursor usage |
+| `AI Usage: Open Claude Usage Page` | Open claude.ai usage settings |
+| `AI Usage: Refresh Claude Usage` | Manually refresh Claude usage |
+| `AI Usage: Authorize Claude (OAuth Login)` | Open browser to authorize Claude via OAuth |
+| `AI Usage: Sign Out Claude` | Remove stored Claude OAuth token |
 
 ## How it works
 
 - **Copilot**: calls `vscode.authentication.getSession('github', ['read:user'])` → queries `api.github.com/copilot_internal/user` (undocumented internal endpoint, may change)
 - **ChatGPT/Codex**: reads `~/.codex/auth.json` for plan/subscription and `~/.codex/logs_1.sqlite` for `x-codex-*` usage headers
 - **Cursor**: reads `state.vscdb` (SQLite) for the Bearer token → queries `api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage` for Auto/API percentages (falls back to `auth/usage` when needed); the status bar keeps a stable `◈` prefix for compatibility across VS Code themes/versions
+- **Claude**: authorizes via OAuth 2.0 PKCE in the browser (`https://claude.com/cai/oauth/authorize`, local callback `http://localhost:<port>/callback`); token stored securely in VS Code `SecretStorage`, auto-refreshed before expiry; then queries `api.anthropic.com/api/oauth/usage` to show 5h/7d remaining percentages. Also supports legacy `aiUsage.claude.oauthToken` setting or `ANTHROPIC_OAUTH_TOKEN` env var.
 
 ## License
 
