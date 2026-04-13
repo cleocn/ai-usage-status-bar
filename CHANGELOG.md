@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [1.0.5] - 2026-04-13
+
+### Fixed
+- Removed temporary Claude debug popups left from 7d utilization troubleshooting.
+- Kept Claude 7d remaining percentage calculation compatible with utilization values returned as either 0-1 or 0-100.
+
 ## [1.0.3] - 2026-04-11
 
 ### Added

@@ -2,7 +2,7 @@
   "name": "ai-usage-status-bar",
   "displayName": "AI Usage Status Bar for VS Code",
   "description": "Show GitHub Copilot, ChatGPT/Codex, Cursor, and Claude usage in the VS Code status bar",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "publisher": "cleocn",
   "license": "MIT",
   "icon": "assets/icon.png",

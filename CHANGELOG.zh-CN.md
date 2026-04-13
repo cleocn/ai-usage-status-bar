@@ -4,6 +4,12 @@
 
 格式参考 Keep a Changelog，版本号遵循 Semantic Versioning。
 
+## [1.0.5] - 2026-04-13
+
+### 修复
+- 移除 Claude 7d 排查阶段遗留的临时 DEBUG 弹窗。
+- 保持 Claude 7d 剩余百分比计算对 utilization 两种返回格式（0-1 或 0-100）的兼容。
+
 ## [1.0.3] - 2026-04-11
 
 ### 新增

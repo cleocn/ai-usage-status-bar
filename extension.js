@@ -873,11 +873,8 @@ async function fetchAndRenderClaude() {
     const sevenDay = data?.seven_day ?? null;
     const fiveUsed = toPctFromUtilization(fiveHour?.utilization);
     const sevenUsed = toPctFromUtilization(sevenDay?.utilization);
-    // DEBUG: 输出原始和转换后数值
-    vscode.window.showInformationMessage(`DEBUG: 7d raw=${sevenDay?.utilization}, used=${sevenUsed}, rem=${sevenUsed === null ? 'null' : 100 - sevenUsed}`);
     const fiveRem = fiveUsed === null ? null : Math.max(0, 100 - fiveUsed);
     const sevenRem = sevenUsed === null ? null : Math.max(0, 100 - sevenUsed);
-    vscode.window.showInformationMessage(`DEBUG: 7d fiveRem=${fiveRem}, sevenRem=${sevenRem}`);
 
     const fiveWindow = fiveHour?.resets_at
       ? formatRemainingDaysLabel(new Date(fiveHour.resets_at).getTime())
@@ -887,11 +884,8 @@ async function fetchAndRenderClaude() {
       : "7d";
 
     const usageParts = [];
-    // DEBUG: usageParts 拼接前
-    // vscode.window.showInformationMessage(`DEBUG: usageParts before: fiveRem=${fiveRem}, sevenRem=${sevenRem}`);
     if (fiveRem !== null) usageParts.push(`${fiveWindow} ${fiveRem}%`);
     if (sevenRem !== null) usageParts.push(`${sevenWindow} ${sevenRem}%`);
-    // vscode.window.showInformationMessage(`DEBUG: usageParts after: ${usageParts.join(' | ')}`);
 
     const verbose = getConfig().get('style', 'minimal') === 'verbose';
     const usageCompact = usageParts.length > 0 ? usageParts.join(" ") : "- -";
