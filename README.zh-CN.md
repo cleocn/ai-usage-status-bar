@@ -10,7 +10,7 @@
 
 ## 功能特性
 
-- **四家提供商** — GitHub Copilot 配额、ChatGPT/Codex 双窗口用量、Cursor 用量、Claude 用量统一展示
+- **四家提供商** — GitHub Copilot 配额、ChatGPT/Codex 双窗口用量、Cursor 用量、Claude 用量统一展示（Claude 在插件市场版本暂时关闭）
 - **重置倒计时前缀** — 每个状态栏项都会在图标后先显示 `Xd`（距离下个重置点的天数）
 - **Codex 动态窗口标签** — 状态栏显示距离重置还剩的时间标签（例如 `3h`、`6d`）和剩余百分比
 - **Cursor 精简外显** — 状态栏显示 Auto/API 剩余百分比，若有 OD 则追加金额数值
@@ -56,7 +56,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 - 已在 VS Code 中登录 GitHub 账号并开启 Copilot
 - 安装并登录 [OpenAI Codex CLI](https://github.com/openai/codex)（ChatGPT 信息需要）
 - 安装并登录 [Cursor](https://cursor.sh)（Cursor 信息需要）
-- Claude：运行命令 **`AI Usage: Authorize Claude (OAuth Login)`** 在浏览器中完成一次性授权
+- Claude：实验功能，由单一开关控制。
 
 ## 平台支持
 
@@ -65,7 +65,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 | GitHub Copilot | ✅ | ✅ | ✅ |
 | ChatGPT / Codex | ✅ | ✅ | ✅ |
 | Cursor | ✅ | ✅ | ✅ |
-| Claude | ✅ | ✅ | ✅ |
+| Claude（实验功能） | ✅ | ✅ | ✅ |
 
 Cursor 的 `state.vscdb` 路径按平台自动解析：
 - **macOS**：`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
@@ -88,10 +88,12 @@ Codex 路径（`~/.codex/`）和 Copilot API 调用默认即跨平台兼容；Cl
   "aiUsage.providers.copilot": true,
   "aiUsage.providers.chatgpt": true,
   "aiUsage.providers.cursor": true,
-  "aiUsage.providers.claude": true,
 
   // 可选：Claude OAuth token（遗留，优先使用命令授权）
-  "aiUsage.claude.oauthToken": ""
+  "aiUsage.claude.oauthToken": "",
+
+  // 单一开关：启用 Claude usage 实验功能
+  "aiUsage.experimental.enableClaudeUsage": false
 }
 ```
 
@@ -122,7 +124,11 @@ Codex 路径（`~/.codex/`）和 Copilot API 调用默认即跨平台兼容；Cl
 - **Copilot**：调用 `vscode.authentication.getSession('github', ['read:user'])` 获取 Token → 请求 `api.github.com/copilot_internal/user`（未文档化内部接口，可能随时变更）
 - **ChatGPT/Codex**：读取 `~/.codex/auth.json` 获取套餐/续费信息，再从 `~/.codex/logs_1.sqlite` 的 `x-codex-*` 响应头提取窗口用量
 - **Cursor**：读取 `state.vscdb`（SQLite）获取 Bearer Token → 请求 `api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage` 获取 Auto/API 百分比（必要时回退 `auth/usage`）；状态栏前缀固定使用兼容性更稳定的 `◈`
-- **Claude**：使用 OAuth 2.0 PKCE 流在浏览器中授权（`https://claude.com/cai/oauth/authorize`，本地回调 `http://localhost:<port>/callback`），token 安全存储在 VS Code `SecretStorage`，到期前自动刷新；调用 `api.anthropic.com/api/oauth/usage` 展示 5h/7d 剩余百分比。也支持通过 `aiUsage.claude.oauthToken` 或环境变量 `ANTHROPIC_OAUTH_TOKEN` 传入 token（遗留方式）
+- **Claude**：由单一实验开关 `aiUsage.experimental.enableClaudeUsage` 控制（默认 `false`）。开启后，数据源优先级为：1) 本地 Claude session JSONL 的 token 统计（5h 窗口）；2) 本地 session 中的 `rate_limits`；3) 最后才回退 OAuth usage API。也就是说 OAuth 现在是兜底数据源，并带有容错策略（429 冷却、最近成功结果缓存回退、无利用率时软回退）。OAuth token 解析顺序为：先 VS Code `SecretStorage`，再 macOS Claude Desktop 本地 cache，最后设置项/环境变量。仅当本地 session 数据不可用时，才调用 `api.anthropic.com/api/oauth/usage`。
+
+## 致谢
+
+- 致敬 [duddudcns/ai-usage-statusbar](https://github.com/duddudcns/ai-usage-statusbar.git) 的优秀实现思路，尤其是在多数据源回退策略与本地信号稳健性方面对本项目有直接启发。
 
 ## License
 

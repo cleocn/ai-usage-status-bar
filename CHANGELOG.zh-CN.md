@@ -4,6 +4,18 @@
 
 格式参考 Keep a Changelog，版本号遵循 Semantic Versioning。
 
+## [1.0.6] - 2026-04-16
+
+### 新增
+- 新增致谢说明，致敬 [duddudcns/ai-usage-statusbar](https://github.com/duddudcns/ai-usage-statusbar.git) 对本项目实现思路的启发。
+
+### 修复
+- Claude 拉取流程改为本地优先：本地 JSONL token 统计 -> 本地 session `rate_limits` -> OAuth usage API。
+- Claude 现在会缓存最近一次成功的限额结果，并在 OAuth 瞬时失败时回退使用缓存。
+- Claude 对 OAuth `429` 增加冷却与回退策略，避免持续重复请求失败。
+- Claude 在“本地有会话但暂时无 utilization 数据”场景下不再直接掉到 `-` 的硬失败显示。
+- Claude token 兜底来源支持 `CLAUDE_CODE_OAUTH_TOKEN`，且 OAuth `403` 会保留“已授权但受限”的状态。
+
 ## [1.0.5] - 2026-04-13
 
 ### 修复

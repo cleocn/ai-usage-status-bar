@@ -10,10 +10,15 @@ const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_AUTH_URL = "https://claude.com/cai/oauth/authorize";
 const CLAUDE_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token";
-const CLAUDE_OAUTH_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_OAUTH_SCOPE = "user:profile user:inference user:sessions:claude_code user:file_upload";
 const ANTHROPIC_API_VERSION = "2023-06-01";
 const CLAUDE_SECRET_KEY = "claude.tokens";
+const CLAUDE_AUTH_STATE_KEY = "claude.authState";
+const CLAUDE_LAST_RATE_LIMIT_KEY = "claude.lastRateLimitResult";
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const CLAUDE_OAUTH_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const CLAUDE_MAX_COOLDOWN_MS = 30 * 60 * 1000;
+const CLAUDE_SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
 const CODEX_DIR = path.join(os.homedir(), ".codex");
 const CODEX_AUTH_PATH = path.join(CODEX_DIR, "auth.json");
 const CURSOR_DB_PATH = path.join(
@@ -32,6 +37,10 @@ let claudeStatusBarItem;
 let refreshTimer;
 let chatgptLastUpdatedAt;
 let extensionContext;
+let lastClaudeRateLimitResult = null;
+let lastClaudeOauth429At = 0;
+let lastClaudeOauth429RetryAfterMs = 5 * 60 * 1000;
+let lastClaudeOauthSuccessAt = 0;
 const CURSOR_ICON_FALLBACK = "◈";
 const CLAUDE_ICON_FALLBACK = "◆";
 
@@ -50,6 +59,23 @@ function getConfig() {
   return vscode.workspace.getConfiguration('aiUsage');
 }
 
+function isClaudeExperimentalEnabled() {
+  return getConfig().get('experimental.enableClaudeUsage', false);
+}
+
+function isClaudeProviderAvailable() {
+  // Single switch for Claude experimental feature.
+  return isClaudeExperimentalEnabled();
+}
+
+function shouldUseClaudeDesktopTokenCache() {
+  return isClaudeExperimentalEnabled();
+}
+
+function getClaudeUnavailableHint() {
+  return "Claude usage 实验功能已关闭。请在设置中开启 aiUsage.experimental.enableClaudeUsage。";
+}
+
 function pickFirstNonEmpty(...values) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value.trim();
@@ -62,7 +88,7 @@ function applyProviderVisibility() {
   cfg.get('providers.copilot', true) ? statusBarItem.show() : statusBarItem.hide();
   cfg.get('providers.chatgpt', true) ? chatgptStatusBarItem.show() : chatgptStatusBarItem.hide();
   cfg.get('providers.cursor', true) ? cursorStatusBarItem.show() : cursorStatusBarItem.hide();
-  cfg.get('providers.claude', true) ? claudeStatusBarItem.show() : claudeStatusBarItem.hide();
+  isClaudeProviderAvailable() ? claudeStatusBarItem.show() : claudeStatusBarItem.hide();
 }
 
 async function activate(context) {
@@ -118,15 +144,31 @@ async function activate(context) {
       fetchAndRenderCursor();
     }),
     vscode.commands.registerCommand("aiUsage.openClaudeUsage", () => {
+      if (!isClaudeProviderAvailable()) {
+        vscode.window.showInformationMessage(getClaudeUnavailableHint());
+        return;
+      }
       vscode.env.openExternal(vscode.Uri.parse("https://claude.ai/settings/usage"));
     }),
     vscode.commands.registerCommand("aiUsage.refreshClaude", () => {
+      if (!isClaudeProviderAvailable()) {
+        vscode.window.showInformationMessage(getClaudeUnavailableHint());
+        return;
+      }
       fetchAndRenderClaude();
     }),
     vscode.commands.registerCommand("aiUsage.authenticateClaude", () => {
+      if (!isClaudeProviderAvailable()) {
+        vscode.window.showInformationMessage(getClaudeUnavailableHint());
+        return;
+      }
       startClaudeOAuth();
     }),
     vscode.commands.registerCommand("aiUsage.signOutClaude", () => {
+      if (!isClaudeProviderAvailable()) {
+        vscode.window.showInformationMessage(getClaudeUnavailableHint());
+        return;
+      }
       signOutClaude();
     })
   );
@@ -606,7 +648,7 @@ function generatePKCE() {
 
 async function startClaudeOAuth() {
   const { codeVerifier, codeChallenge } = generatePKCE();
-  const state = base64urlEncode(crypto.randomBytes(16));
+  const state = base64urlEncode(crypto.randomBytes(32));
 
   // Find a free local port for the OAuth callback (RFC 8252 loopback redirect)
   let port;
@@ -632,6 +674,7 @@ async function startClaudeOAuth() {
     code_challenge_method: "S256",
     state,
   });
+  const authQuery = authParams.toString();
 
   let serverResolve, serverReject;
   const callbackPromise = new Promise((res, rej) => { serverResolve = res; serverReject = rej; });
@@ -658,7 +701,7 @@ async function startClaudeOAuth() {
     serverReject(new Error("授权超时（5 分钟），请重试"));
   }, 5 * 60 * 1000);
 
-  await vscode.env.openExternal(vscode.Uri.parse(`${CLAUDE_AUTH_URL}?${authParams}`));
+  await vscode.env.openExternal(vscode.Uri.parse(`${CLAUDE_AUTH_URL}?${authQuery}`));
 
   try {
     const { code, redirectUri: usedRedirectUri } = await callbackPromise;
@@ -675,12 +718,16 @@ async function startClaudeOAuth() {
         code,
         redirect_uri: usedRedirectUri,
         code_verifier: codeVerifier,
-        state,
-        scope: CLAUDE_OAUTH_SCOPE,
       }),
     });
     if (!tokenRes.ok) {
       const text = await tokenRes.text();
+      if (tokenRes.status === 403 && /Request not allowed/i.test(text)) {
+        await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, {
+          kind: "oauth_forbidden",
+          message: "Anthropic rejected the code exchange with 403 Request not allowed.",
+        });
+      }
       throw new Error(`token 交换失败: ${tokenRes.status} ${text.substring(0, 200)}`);
     }
     const tokens = await tokenRes.json();
@@ -695,6 +742,7 @@ async function startClaudeOAuth() {
       throw new Error("token 响应缺少 access_token");
     }
     await extensionContext.secrets.store(CLAUDE_SECRET_KEY, JSON.stringify(tokenData));
+    await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, undefined);
     vscode.window.showInformationMessage("Claude 授权成功！");
     await fetchAndRenderClaude();
   } catch (e) {
@@ -716,7 +764,6 @@ async function refreshClaudeToken(tokenData) {
         grant_type: "refresh_token",
         client_id: CLAUDE_CLIENT_ID,
         refresh_token: tokenData.refreshToken,
-        scope: CLAUDE_OAUTH_SCOPE,
       }),
     });
     if (!tokenRes.ok) return null;
@@ -738,6 +785,7 @@ async function refreshClaudeToken(tokenData) {
 
 async function signOutClaude() {
   await extensionContext.secrets.delete(CLAUDE_SECRET_KEY).catch(() => {});
+  await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, undefined);
   claudeStatusBarItem.text = `${getClaudePrefix()} Claude: 未授权`;
   claudeStatusBarItem.tooltip = "已退出 Claude，点击重新授权";
   claudeStatusBarItem.command = "aiUsage.authenticateClaude";
@@ -746,7 +794,7 @@ async function signOutClaude() {
 }
 
 async function resolveClaudeToken() {
-  // 1. SecretStorage (from OAuth flow)
+  // 1. SecretStorage (from OAuth flow) - PREFERRED for reliability
   try {
     const raw = await extensionContext.secrets.get(CLAUDE_SECRET_KEY);
     if (raw) {
@@ -761,65 +809,77 @@ async function resolveClaudeToken() {
     }
   } catch {}
 
-  // 2. Claude Desktop app — read encrypted token from config.json (macOS only)
-  if (os.platform() === "darwin") {
+  // 2. Claude Code/Desktop local token cache (macOS only) - FALLBACK
+  if (shouldUseClaudeDesktopTokenCache() && os.platform() === "darwin") {
     try {
-      const token = await readClaudeDesktopToken();
-      if (token) return token;
+      const desktopToken = await readClaudeDesktopToken();
+      if (desktopToken) return desktopToken;
     } catch {}
   }
 
   // 3. Legacy fallback: settings or environment variable
   const cfgToken = getConfig().get('claude.oauthToken', '');
-  return pickFirstNonEmpty(cfgToken, process.env.ANTHROPIC_OAUTH_TOKEN, process.env.CLAUDE_OAUTH_TOKEN) ?? null;
+  return pickFirstNonEmpty(
+    cfgToken,
+    process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    process.env.ANTHROPIC_OAUTH_TOKEN,
+    process.env.CLAUDE_OAUTH_TOKEN
+  ) ?? null;
 }
 
-/**
- * Read the OAuth access_token from Claude Desktop's config.json.
- * The value is encrypted with Chromium OSCrypt (AES-128-CBC, key from macOS Keychain).
- */
 async function readClaudeDesktopToken() {
   const configPath = path.join(os.homedir(), "Library", "Application Support", "Claude", "config.json");
   if (!fs.existsSync(configPath)) return null;
-  const configRaw = fs.readFileSync(configPath, "utf8");
-  const config = JSON.parse(configRaw);
-  const encryptedB64 = config["oauth:tokenCache"];
+
+  const raw = fs.readFileSync(configPath, "utf8");
+  const parsed = JSON.parse(raw);
+  const encryptedB64 = parsed["oauth:tokenCache"];
   if (typeof encryptedB64 !== "string") return null;
 
   const encryptedBuf = Buffer.from(encryptedB64, "base64");
   if (encryptedBuf.slice(0, 3).toString() !== "v10") return null;
   const ciphertext = encryptedBuf.slice(3);
 
-  // Get password from macOS Keychain
   const { execSync } = require("child_process");
   let password;
   try {
     password = execSync('security find-generic-password -s "Claude Safe Storage" -a "Claude Key" -w', {
       encoding: "utf8",
+      timeout: 3000,
     }).trim();
   } catch {
     return null;
   }
   if (!password) return null;
 
-  // Derive 128-bit key: PBKDF2(password, "saltysalt", 1003 iterations, 16 bytes, SHA-1)
   const key = await new Promise((resolve, reject) => {
     crypto.pbkdf2(password, "saltysalt", 1003, 16, "sha1", (err, derivedKey) => {
       if (err) reject(err); else resolve(derivedKey);
     });
   });
 
-  // Decrypt AES-128-CBC with IV = 16 space characters
   const iv = Buffer.alloc(16, 0x20);
   const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
   decipher.setAutoPadding(true);
   const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
 
-  // tokenCache structure: { [clientId:orgId:audience:scopes]: { token, refreshToken, expiresAt } }
   const tokenCache = JSON.parse(decrypted);
-  const entry = Object.values(tokenCache)[0];
-  if (!entry || typeof entry !== "object") return null;
-  return entry.token ?? entry.access_token ?? entry.accessToken ?? null;
+  const candidates = Object.entries(tokenCache)
+    .map(([cacheKey, value]) => {
+      const token = value?.token ?? value?.access_token ?? value?.accessToken ?? null;
+      const expiresAt = Number(value?.expiresAt ?? 0) || 0;
+      const hasClaudeCodeScope = typeof cacheKey === "string" && cacheKey.includes("user:sessions:claude_code");
+      return { token, expiresAt, hasClaudeCodeScope };
+    })
+    .filter((item) => typeof item.token === "string" && item.token.length > 0)
+    .sort((a, b) => {
+      if (a.hasClaudeCodeScope !== b.hasClaudeCodeScope) {
+        return a.hasClaudeCodeScope ? -1 : 1;
+      }
+      return b.expiresAt - a.expiresAt;
+    });
+
+  return candidates[0]?.token ?? null;
 }
 
 async function fetchClaudeUsage(token) {
@@ -832,6 +892,314 @@ async function fetchClaudeUsage(token) {
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+function normalizeEpochSeconds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value > 1e12) return Math.floor(value / 1000);
+    if (value > 1e9) return Math.floor(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    const asNum = Number(value);
+    if (Number.isFinite(asNum)) {
+      if (asNum > 1e12) return Math.floor(asNum / 1000);
+      if (asNum > 1e9) return Math.floor(asNum);
+    }
+    const ts = new Date(value).getTime();
+    if (Number.isFinite(ts)) return Math.floor(ts / 1000);
+  }
+  return null;
+}
+
+function normalizeUtilizationToUsedPercent(utilization) {
+  if (typeof utilization !== "number" || Number.isNaN(utilization)) return null;
+  if (utilization > 1) return Math.max(0, Math.min(100, Math.round(utilization)));
+  return Math.max(0, Math.min(100, Math.round(utilization * 100)));
+}
+
+function shouldAssumeClaudeFullFromNoData(oauthError, projectsRoot) {
+  const msg = String(oauthError || "").toLowerCase();
+  if (msg.includes("no utilization data")) return true;
+  if (projectsRoot && fs.existsSync(projectsRoot)) return true;
+  return false;
+}
+
+function isClaudeRateLimitError(err) {
+  const msg = String(err || "").toLowerCase();
+  return msg.includes("http 429") || msg.includes("rate_limit_error") || msg.includes("rate limit cooldown");
+}
+
+function isClaudeTransientError(err) {
+  const msg = String(err || "").toLowerCase();
+  return (
+    msg.includes("request timed out") ||
+    msg.includes("http 500") ||
+    msg.includes("internal server error") ||
+    msg.includes("econnreset") ||
+    msg.includes("network")
+  );
+}
+
+function buildClaudeAssumedFullResult(reason) {
+  const rateLimits = {
+    primary: { used_percent: 0, resets_at: null },
+    secondary: { used_percent: 0, resets_at: null },
+  };
+  return {
+    ok: true,
+    sourceLabel: `${reason} (assumed full)`,
+    rateLimits,
+  };
+}
+
+function parseClaudeApiRateLimits(data) {
+  const primary = {
+    used_percent: normalizeUtilizationToUsedPercent(data?.five_hour?.utilization),
+    resets_at: normalizeEpochSeconds(data?.five_hour?.resets_at),
+  };
+  const secondary = {
+    used_percent: normalizeUtilizationToUsedPercent(data?.seven_day?.utilization),
+    resets_at: normalizeEpochSeconds(data?.seven_day?.resets_at),
+  };
+  if (primary.used_percent === null && secondary.used_percent === null) {
+    return buildClaudeAssumedFullResult("Claude OAuth API");
+  }
+  return {
+    ok: true,
+    sourceLabel: "Claude OAuth API",
+    rateLimits: { primary, secondary },
+  };
+}
+
+function formatClaudeUsageCompact(rateLimits) {
+  const primaryUsed = rateLimits?.primary?.used_percent;
+  const secondaryUsed = rateLimits?.secondary?.used_percent;
+  const primaryRem = typeof primaryUsed === "number" ? Math.max(0, 100 - primaryUsed) : null;
+  const secondaryRem = typeof secondaryUsed === "number" ? Math.max(0, 100 - secondaryUsed) : null;
+  const primaryWindow = rateLimits?.primary?.resets_at
+    ? formatRemainingDaysLabel(rateLimits.primary.resets_at * 1000)
+    : "5h";
+  const secondaryWindow = rateLimits?.secondary?.resets_at
+    ? formatRemainingDaysLabel(rateLimits.secondary.resets_at * 1000)
+    : "7d";
+  const usageParts = [];
+  if (primaryRem !== null) usageParts.push(`${primaryWindow} ${primaryRem}%`);
+  if (secondaryRem !== null) usageParts.push(`${secondaryWindow} ${secondaryRem}%`);
+  return usageParts.length > 0 ? usageParts.join(" ") : "- -";
+}
+
+function renderClaudeRateLimits(rateLimitResult) {
+  const claudePrefix = getClaudePrefix();
+  const verbose = getConfig().get('style', 'minimal') === 'verbose';
+  const rateLimits = rateLimitResult?.rateLimits ?? {};
+  const usageCompact = formatClaudeUsageCompact(rateLimits);
+  const primaryUsed = rateLimits?.primary?.used_percent;
+  const secondaryUsed = rateLimits?.secondary?.used_percent;
+  const primaryRem = typeof primaryUsed === "number" ? Math.max(0, 100 - primaryUsed) : null;
+  const secondaryRem = typeof secondaryUsed === "number" ? Math.max(0, 100 - secondaryUsed) : null;
+
+  claudeStatusBarItem.text = verbose
+    ? `${claudePrefix} Claude ${usageCompact}`
+    : `${claudePrefix} ${usageCompact}`;
+
+  claudeStatusBarItem.tooltip = [
+    "Claude 用量",
+    primaryUsed !== null && primaryUsed !== undefined
+      ? `5h 窗口: 已用 ${primaryUsed}% / 剩余 ${primaryRem}%`
+      : "5h 窗口: 暂无数据",
+    secondaryUsed !== null && secondaryUsed !== undefined
+      ? `7d 窗口: 已用 ${secondaryUsed}% / 剩余 ${secondaryRem}%`
+      : "7d 窗口: 暂无数据",
+    rateLimits?.primary?.resets_at
+      ? `5h 重置时间: ${new Date(rateLimits.primary.resets_at * 1000).toLocaleString("zh-CN")}`
+      : "",
+    rateLimits?.secondary?.resets_at
+      ? `7d 重置时间: ${new Date(rateLimits.secondary.resets_at * 1000).toLocaleString("zh-CN")}`
+      : "",
+    "",
+    `数据来源: ${rateLimitResult?.sourceLabel || "未知"}`,
+    "点击打开 claude.ai 用量页面",
+  ].filter(Boolean).join("\n");
+
+  const lowestRemaining = [primaryRem, secondaryRem]
+    .filter((v) => typeof v === "number")
+    .reduce((min, v) => Math.min(min, v), 100);
+  claudeStatusBarItem.backgroundColor = lowestRemaining <= 20
+    ? new vscode.ThemeColor("statusBarItem.warningBackground")
+    : undefined;
+  claudeStatusBarItem.command = "aiUsage.refreshClaude";
+}
+
+function readLatestClaudeRateLimitsFromSession(filePath) {
+  const content = fs.readFileSync(filePath, "utf8");
+  const lines = content.split(/\r?\n/);
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      const candidates = [
+        obj?.rate_limits,
+        obj?.message?.rate_limits,
+        obj?.data?.rate_limits,
+        obj?.data?.message?.rate_limits,
+        obj?.payload?.rate_limits,
+      ];
+      for (const rl of candidates) {
+        if (rl && (rl.five_hour || rl.seven_day)) {
+          return {
+            primary: {
+              used_percent: normalizeUtilizationToUsedPercent(rl.five_hour?.utilization),
+              resets_at: normalizeEpochSeconds(rl.five_hour?.resets_at),
+            },
+            secondary: {
+              used_percent: normalizeUtilizationToUsedPercent(rl.seven_day?.utilization),
+              resets_at: normalizeEpochSeconds(rl.seven_day?.resets_at),
+            },
+          };
+        }
+      }
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  return null;
+}
+
+function findNewestClaudeSessionWithRateLimits(rootDir, maxCandidates = 20) {
+  if (!fs.existsSync(rootDir)) return null;
+
+  const files = [];
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.isFile() || !full.endsWith(".jsonl")) continue;
+      try {
+        const stat = fs.statSync(full);
+        files.push({ filePath: full, mtimeMs: stat.mtimeMs });
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (let i = 0; i < Math.min(files.length, Math.max(1, maxCandidates)); i += 1) {
+    const item = files[i];
+    try {
+      const rateLimits = readLatestClaudeRateLimitsFromSession(item.filePath);
+      if (rateLimits) return { filePath: item.filePath, rateLimits };
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
+function buildClaudeRateLimitsFromLocalTokenCount(projectsRoot, credPath) {
+  try {
+    let planLimit = 44000;
+    try {
+      if (fs.existsSync(credPath)) {
+        const cred = JSON.parse(fs.readFileSync(credPath, "utf8"));
+        const subType = String(cred?.claudeAiOauth?.subscriptionType || "").toLowerCase();
+        if (subType.includes("max_20") || subType.includes("max20")) planLimit = 220000;
+        else if (subType.includes("max_5") || subType.includes("max5")) planLimit = 88000;
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!fs.existsSync(projectsRoot)) return null;
+
+    const files = [];
+    const stack = [projectsRoot];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      let entries = [];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+          continue;
+        }
+        if (entry.isFile() && full.endsWith(".jsonl")) files.push(full);
+      }
+    }
+
+    const now = Date.now();
+    const windowStart = now - CLAUDE_SESSION_WINDOW_MS;
+    const seenIds = new Set();
+    const messages = [];
+
+    for (const filePath of files) {
+      let content = "";
+      try {
+        content = fs.readFileSync(filePath, "utf8");
+      } catch {
+        continue;
+      }
+      const lines = content.split(/\r?\n/);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj?.type !== "assistant") continue;
+          const msgId = obj?.uuid || obj?.message?.id || null;
+          if (msgId && seenIds.has(msgId)) continue;
+          if (msgId) seenIds.add(msgId);
+          const ts = obj?.timestamp ? new Date(obj.timestamp).getTime() : 0;
+          if (!ts || ts < windowStart) continue;
+          const usage = obj?.message?.usage;
+          if (!usage) continue;
+          const tokens = Number(usage.input_tokens || 0) + Number(usage.output_tokens || 0);
+          if (tokens > 0) messages.push({ ts, tokens });
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (messages.length === 0) return null;
+
+    messages.sort((a, b) => a.ts - b.ts);
+    const sessionStart = messages[0].ts;
+    const sessionEnd = sessionStart + CLAUDE_SESSION_WINDOW_MS;
+    const usedTokens = messages.reduce((sum, msg) => sum + msg.tokens, 0);
+    const usedPercent = Math.min((usedTokens / planLimit) * 100, 100);
+
+    return {
+      ok: true,
+      sourceLabel: `local JSONL token count (${usedTokens}/${planLimit} tokens)`,
+      rateLimits: {
+        primary: {
+          used_percent: Math.round(usedPercent),
+          resets_at: Math.floor(sessionEnd / 1000),
+        },
+        secondary: null,
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
 function toPctFromUtilization(utilization) {
@@ -847,20 +1215,79 @@ function toPctFromUtilization(utilization) {
 }
 
 async function fetchAndRenderClaude() {
+  if (!isClaudeProviderAvailable()) {
+    claudeStatusBarItem.hide();
+    return;
+  }
+
   const claudePrefix = getClaudePrefix();
   claudeStatusBarItem.text = "$(sync~spin) Claude";
   claudeStatusBarItem.tooltip = "Claude 用量加载中…";
 
+  if (!lastClaudeRateLimitResult && extensionContext) {
+    const persisted = extensionContext.globalState.get(CLAUDE_LAST_RATE_LIMIT_KEY);
+    if (persisted?.ok && persisted?.rateLimits) {
+      lastClaudeRateLimitResult = persisted;
+    }
+  }
+
+  const projectsRoot = path.join(os.homedir(), ".claude", "projects");
+  const credPath = path.join(os.homedir(), ".claude", ".credentials.json");
+
+  const localTokenCountResult = buildClaudeRateLimitsFromLocalTokenCount(projectsRoot, credPath);
+  if (localTokenCountResult?.ok) {
+    lastClaudeRateLimitResult = localTokenCountResult;
+    await extensionContext.globalState.update(CLAUDE_LAST_RATE_LIMIT_KEY, localTokenCountResult);
+    renderClaudeRateLimits(localTokenCountResult);
+    return;
+  }
+
+  const sessionHit = findNewestClaudeSessionWithRateLimits(projectsRoot, 20);
+  if (sessionHit?.rateLimits) {
+    const sessionResult = {
+      ok: true,
+      sourceLabel: "local session rate limits",
+      rateLimits: sessionHit.rateLimits,
+    };
+    lastClaudeRateLimitResult = sessionResult;
+    await extensionContext.globalState.update(CLAUDE_LAST_RATE_LIMIT_KEY, sessionResult);
+    renderClaudeRateLimits(sessionResult);
+    return;
+  }
+
+  if (lastClaudeOauthSuccessAt && Date.now() - lastClaudeOauthSuccessAt < CLAUDE_OAUTH_MIN_INTERVAL_MS && lastClaudeRateLimitResult?.ok) {
+    renderClaudeRateLimits({ ...lastClaudeRateLimitResult, sourceLabel: `${lastClaudeRateLimitResult.sourceLabel} (cached)` });
+    return;
+  }
+
+  if (lastClaudeOauth429At && Date.now() - lastClaudeOauth429At < lastClaudeOauth429RetryAfterMs) {
+    if (lastClaudeRateLimitResult?.ok) {
+      renderClaudeRateLimits({ ...lastClaudeRateLimitResult, sourceLabel: `${lastClaudeRateLimitResult.sourceLabel} (cached)` });
+      return;
+    }
+  }
+
   const token = await resolveClaudeToken();
   if (!token) {
+    const authState = extensionContext.globalState.get(CLAUDE_AUTH_STATE_KEY);
+    if (authState?.kind === "oauth_forbidden") {
+      claudeStatusBarItem.text = `${claudePrefix} Claude: OAuth受限`;
+      claudeStatusBarItem.tooltip = [
+        "Claude 浏览器授权已完成回调，但 token 交换被 Anthropic 拒绝",
+        "错误: 403 Request not allowed",
+        "官方文档说明：未获批准的第三方产品不能提供 claude.ai 登录或其 rate limits",
+        "可改用现成 OAuth token 环境变量/设置，或关闭 Claude 状态栏项",
+      ].join("\n");
+      claudeStatusBarItem.command = "aiUsage.authenticateClaude";
+      claudeStatusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      return;
+    }
+
     claudeStatusBarItem.text = `${claudePrefix} Claude: 未授权`;
-    const isMac = os.platform() === "darwin";
     claudeStatusBarItem.tooltip = [
       "尚未授权 Claude",
-      isMac
-        ? "• 若已安装 Claude Desktop，重启 VS Code 后会自动读取授权（macOS Keychain）"
-        : "",
-      "• 或点击运行命令「AI Usage: Authorize Claude (OAuth Login)」手动授权",
+      "• 点击运行命令「AI Usage: Authorize Claude (OAuth Login)」完成显式 OAuth 授权",
+      "• 或在设置 aiUsage.claude.oauthToken / 环境变量中提供 OAuth token（遗留方式）",
     ].filter(Boolean).join("\n");
     claudeStatusBarItem.command = "aiUsage.authenticateClaude";
     claudeStatusBarItem.backgroundColor = undefined;
@@ -869,56 +1296,58 @@ async function fetchAndRenderClaude() {
 
   try {
     const data = await fetchClaudeUsage(token);
-    const fiveHour = data?.five_hour ?? null;
-    const sevenDay = data?.seven_day ?? null;
-    const fiveUsed = toPctFromUtilization(fiveHour?.utilization);
-    const sevenUsed = toPctFromUtilization(sevenDay?.utilization);
-    const fiveRem = fiveUsed === null ? null : Math.max(0, 100 - fiveUsed);
-    const sevenRem = sevenUsed === null ? null : Math.max(0, 100 - sevenUsed);
-
-    const fiveWindow = fiveHour?.resets_at
-      ? formatRemainingDaysLabel(new Date(fiveHour.resets_at).getTime())
-      : "5h";
-    const sevenWindow = sevenDay?.resets_at
-      ? formatRemainingDaysLabel(new Date(sevenDay.resets_at).getTime())
-      : "7d";
-
-    const usageParts = [];
-    if (fiveRem !== null) usageParts.push(`${fiveWindow} ${fiveRem}%`);
-    if (sevenRem !== null) usageParts.push(`${sevenWindow} ${sevenRem}%`);
-
-    const verbose = getConfig().get('style', 'minimal') === 'verbose';
-    const usageCompact = usageParts.length > 0 ? usageParts.join(" ") : "- -";
-    claudeStatusBarItem.text = verbose
-      ? `${claudePrefix} Claude ${usageCompact}`
-      : `${claudePrefix} ${usageCompact}`;
-
-    claudeStatusBarItem.tooltip = [
-      "Claude 用量",
-      fiveUsed !== null ? `5h 窗口: 已用 ${fiveUsed}% / 剩余 ${fiveRem}%` : "5h 窗口: 暂无数据",
-      sevenUsed !== null ? `7d 窗口: 已用 ${sevenUsed}% / 剩余 ${sevenRem}%` : "7d 窗口: 暂无数据",
-      sevenDay && typeof sevenDay.utilization === 'number' ? `7d utilization 原始值: ${sevenDay.utilization}` : "",
-      fiveHour?.resets_at ? `5h 重置时间: ${new Date(fiveHour.resets_at).toLocaleString("zh-CN")}` : "",
-      sevenDay?.resets_at ? `7d 重置时间: ${new Date(sevenDay.resets_at).toLocaleString("zh-CN")}` : "",
-      "",
-      "数据来自 api.anthropic.com/api/oauth/usage",
-      "点击打开 claude.ai 用量页面",
-    ].filter(Boolean).join("\n");
-
-    const lowestRemaining = [fiveRem, sevenRem]
-      .filter((v) => typeof v === "number")
-      .reduce((min, v) => Math.min(min, v), 100);
-    claudeStatusBarItem.backgroundColor = lowestRemaining <= 20
-      ? new vscode.ThemeColor("statusBarItem.warningBackground")
-      : undefined;
-    claudeStatusBarItem.command = "aiUsage.refreshClaude";
+    const oauthResult = parseClaudeApiRateLimits(data);
+    lastClaudeRateLimitResult = oauthResult;
+    lastClaudeOauth429At = 0;
+    lastClaudeOauth429RetryAfterMs = 5 * 60 * 1000;
+    lastClaudeOauthSuccessAt = Date.now();
+    await extensionContext.globalState.update(CLAUDE_LAST_RATE_LIMIT_KEY, oauthResult);
+    await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, undefined);
+    renderClaudeRateLimits(oauthResult);
   } catch (e) {
     const is401 = /HTTP 401/.test(e.message);
+    const is403 = /HTTP 403/.test(e.message);
+    const is429 = /HTTP 429/.test(e.message);
+    const isTransient = isClaudeTransientError(e.message);
+
+    if (is429) {
+      lastClaudeOauth429At = Date.now();
+      lastClaudeOauth429RetryAfterMs = Math.min(lastClaudeOauth429RetryAfterMs * 2, CLAUDE_MAX_COOLDOWN_MS);
+    }
+
+    if ((is429 || isTransient) && lastClaudeRateLimitResult?.ok) {
+      renderClaudeRateLimits({ ...lastClaudeRateLimitResult, sourceLabel: `${lastClaudeRateLimitResult.sourceLabel} (cached)` });
+      return;
+    }
+
+    if (shouldAssumeClaudeFullFromNoData(e.message, projectsRoot)) {
+      const assumed = buildClaudeAssumedFullResult("no data available");
+      lastClaudeRateLimitResult = assumed;
+      await extensionContext.globalState.update(CLAUDE_LAST_RATE_LIMIT_KEY, assumed);
+      renderClaudeRateLimits(assumed);
+      return;
+    }
+
     if (is401) {
       await extensionContext.secrets.delete(CLAUDE_SECRET_KEY).catch(() => {});
+      await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, undefined);
       claudeStatusBarItem.text = `${claudePrefix} Claude: 需重新授权`;
-      claudeStatusBarItem.tooltip = "Claude token 已失效，点击重新授权";
+      claudeStatusBarItem.tooltip = "Claude token 已失效（401），请点击重新授权";
       claudeStatusBarItem.command = "aiUsage.authenticateClaude";
+    } else if (is403) {
+      // 403 usually means the current OAuth token lacks usage-endpoint permission;
+      // keep the token to avoid bouncing back to an unauthenticated state.
+      await extensionContext.globalState.update(CLAUDE_AUTH_STATE_KEY, {
+        kind: "usage_forbidden",
+        message: "The current OAuth token cannot access the usage endpoint.",
+      });
+      claudeStatusBarItem.text = `${claudePrefix} Claude: 已授权(403)`;
+      claudeStatusBarItem.tooltip = [
+        "Claude 已完成授权，但 usage 接口返回 403 (Request not allowed)",
+        "这通常是账号/权限策略导致，不代表本地授权丢失",
+        "可点击重试，或重新运行授权命令获取新 token",
+      ].join("\n");
+      claudeStatusBarItem.command = "aiUsage.refreshClaude";
     } else {
       claudeStatusBarItem.text = `${claudePrefix} -`;
       claudeStatusBarItem.tooltip = `Claude 获取失败: ${e.message}\n点击重试`;

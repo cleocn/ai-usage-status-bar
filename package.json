@@ -2,7 +2,7 @@
   "name": "ai-usage-status-bar",
   "displayName": "AI Usage Status Bar for VS Code",
   "description": "Show GitHub Copilot, ChatGPT/Codex, Cursor, and Claude usage in the VS Code status bar",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "publisher": "cleocn",
   "license": "MIT",
   "icon": "assets/icon.png",
@@ -83,15 +83,15 @@
           "default": true,
           "description": "在状态栏显示 Cursor 用量"
         },
-        "aiUsage.providers.claude": {
-          "type": "boolean",
-          "default": true,
-          "description": "在状态栏显示 Claude 用量"
-        },
         "aiUsage.claude.oauthToken": {
           "type": "string",
           "default": "",
           "description": "Claude OAuth token（可选；优先于环境变量 ANTHROPIC_OAUTH_TOKEN / CLAUDE_OAUTH_TOKEN）"
+        },
+        "aiUsage.experimental.enableClaudeUsage": {
+          "type": "boolean",
+          "default": false,
+          "description": "实验功能总开关：开启后启用 Claude usage（包含 OAuth 与本地 token cache fallback）"
         }
       }
     }

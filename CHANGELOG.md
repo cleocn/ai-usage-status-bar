@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [1.0.6] - 2026-04-16
+
+### Added
+- Added acknowledgement to [duddudcns/ai-usage-statusbar](https://github.com/duddudcns/ai-usage-statusbar.git) for implementation inspiration.
+
+### Fixed
+- Claude fetch flow now prefers local data before OAuth API: local JSONL token-count -> local session `rate_limits` -> OAuth usage API.
+- Claude now caches last successful rate-limit result and reuses it during transient OAuth failures.
+- Claude now applies cooldown/backoff for OAuth `429` responses to avoid repeated failing requests.
+- Claude soft no-data behavior now avoids hard `-` states when local session context exists.
+- Claude token fallback supports `CLAUDE_CODE_OAUTH_TOKEN`, and OAuth `403` keeps an authorized-but-forbidden status.
+
 ## [1.0.5] - 2026-04-13
 
 ### Fixed

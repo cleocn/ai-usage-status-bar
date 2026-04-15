@@ -10,7 +10,7 @@ English | [中文](./README.zh-CN.md)
 
 ## Features
 
-- **4 providers** — GitHub Copilot quota, ChatGPT/Codex quota windows, Cursor usage, and Claude usage in one place
+- **4 providers** — GitHub Copilot quota, ChatGPT/Codex quota windows, Cursor usage, and Claude usage in one place (Claude is temporarily disabled in marketplace builds)
 - **Reset countdown prefix** — each item starts with an `Xd` countdown to the next reset point
 - **Codex dynamic windows** — status bar uses remaining-to-reset labels (for example `3h` and `6d`) with remaining %
 - **Cursor compact usage** — status bar shows Auto/API remaining % and appends OD amount when available
@@ -56,7 +56,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 - GitHub account signed in to VS Code with Copilot enabled
 - [OpenAI Codex CLI](https://github.com/openai/codex) installed and signed in (for ChatGPT info)
 - [Cursor](https://cursor.sh) installed and signed in (for Cursor info)
-- Claude: run **`AI Usage: Authorize Claude (OAuth Login)`** to complete a one-time browser authorization
+- Claude: experimental feature, controlled by one switch.
 
 ## Platform Support
 
@@ -65,7 +65,7 @@ code --install-extension ai-usage-status-bar-1.0.3.vsix
 | GitHub Copilot | ✅ | ✅ | ✅ |
 | ChatGPT / Codex | ✅ | ✅ | ✅ |
 | Cursor | ✅ | ✅ | ✅ |
-| Claude | ✅ | ✅ | ✅ |
+| Claude (experimental) | ✅ | ✅ | ✅ |
 
 Cursor's `state.vscdb` is resolved per platform automatically:
 - **macOS**: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
@@ -89,10 +89,12 @@ Search **"AI Usage"** in VS Code Settings, or edit `settings.json` directly:
   "aiUsage.providers.copilot": true,
   "aiUsage.providers.chatgpt": true,
   "aiUsage.providers.cursor": true,
-  "aiUsage.providers.claude": true,
 
   // Optional: Claude OAuth token (legacy, prefer command-based auth)
-  "aiUsage.claude.oauthToken": ""
+  "aiUsage.claude.oauthToken": "",
+
+  // Single switch: enable Claude usage experimental feature
+  "aiUsage.experimental.enableClaudeUsage": false
 }
 ```
 
@@ -123,7 +125,11 @@ Settings take effect immediately without reloading.
 - **Copilot**: calls `vscode.authentication.getSession('github', ['read:user'])` → queries `api.github.com/copilot_internal/user` (undocumented internal endpoint, may change)
 - **ChatGPT/Codex**: reads `~/.codex/auth.json` for plan/subscription and `~/.codex/logs_1.sqlite` for `x-codex-*` usage headers
 - **Cursor**: reads `state.vscdb` (SQLite) for the Bearer token → queries `api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage` for Auto/API percentages (falls back to `auth/usage` when needed); the status bar keeps a stable `◈` prefix for compatibility across VS Code themes/versions
-- **Claude**: authorizes via OAuth 2.0 PKCE in the browser (`https://claude.com/cai/oauth/authorize`, local callback `http://localhost:<port>/callback`); token stored securely in VS Code `SecretStorage`, auto-refreshed before expiry; then queries `api.anthropic.com/api/oauth/usage` to show 5h/7d remaining percentages. Also supports legacy `aiUsage.claude.oauthToken` setting or `ANTHROPIC_OAUTH_TOKEN` env var.
+- **Claude**: controlled by one experimental switch: `aiUsage.experimental.enableClaudeUsage` (default `false`). When enabled, data source order is: (1) local Claude session JSONL token-count (5h window), (2) local session `rate_limits`, then (3) OAuth usage API. OAuth is now a fallback source and includes transient-failure handling (429 cooldown, cached last-success result, and no-data soft fallback). OAuth token resolution is: VS Code `SecretStorage` first, then Claude Desktop local cache on macOS, then manual setting/env token fallback. OAuth uses PKCE in browser (`https://claude.com/cai/oauth/authorize`, local callback `http://localhost:<port>/callback`) and queries `api.anthropic.com/api/oauth/usage` when local session data is unavailable.
+
+## Acknowledgements
+
+- Inspired by the excellent implementation ideas in [duddudcns/ai-usage-statusbar](https://github.com/duddudcns/ai-usage-statusbar.git), especially around provider fallback strategy and robustness for local usage signals.
 
 ## License
 
